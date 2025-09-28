@@ -5,6 +5,12 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 contract AIBToken is ERC20, Ownable {
+    uint256 private constant BASIS_POINTS = 10_000;
+    uint256 private constant MIN_FEE_BPS = 100; // 1%
+    uint256 private constant MAX_FEE_BPS = 1_000; // 10%
+    uint256 private constant MIN_MAX_SELL_PERCENT = 50; // 0.5%
+    uint256 private constant MAX_MAX_SELL_PERCENT = 1_000; // 10%
+
     mapping(address => bool) public isWhitelisted;
     mapping(address => bool) public isBlacklisted;
 
@@ -18,6 +24,17 @@ contract AIBToken is ERC20, Ownable {
     bool public tradingEnabled = false;
 
     uint256 public constant BRIDGE_CHAIN_ID = 1; // Ethereum mainnet
+
+    error SenderBlacklisted();
+    error RecipientBlacklisted();
+    error TradingNotEnabled();
+    error SellAmountExceedsLimit();
+    error BuyFeeOutOfBounds(uint256 fee); // Fee denominated in basis points
+    error SellFeeOutOfBounds(uint256 fee);
+    error MaxSellPercentOutOfBounds(uint256 percent);
+    error InvalidAddress();
+    error UnauthorizedBridgeCaller();
+    error BridgeMintDisabled();
 
     event FeeUpdated(uint256 newBuyFee, uint256 newSellFee);
     event WhitelistUpdated(address indexed account, bool isWhitelisted);
@@ -58,59 +75,27 @@ contract AIBToken is ERC20, Ownable {
     }
 
     function _update(address from, address to, uint256 value) internal override {
-        if (from != address(0) && isBlacklisted[from]) {
-            revert("Sender blacklisted");
-        }
-        if (to != address(0) && isBlacklisted[to]) {
-            revert("Recipient blacklisted");
-        }
+        _enforceBlacklist(from, to);
+        _enforceTradingWindow(from, to);
+        _enforceSellLimit(from, to, value);
 
-        // Block adding liquidity until trading enabled (user -> pool transfer)
-        if (!tradingEnabled && from != address(0) && to != address(0)) {
-            require(!_isLiquidityPool(to), "Adding liquidity disabled");
-        }
-
-        // Check max sell limit (only for sells to contracts/pools)
-        if (from != address(0) && _isLiquidityPool(to) && !isWhitelisted[from]) {
-            uint256 maxSellAmount = (totalSupply() * maxSellPercent) / 10000;
-            require(value <= maxSellAmount, "Sell amount exceeds max sell limit");
-        }
-
-        bool takeFee = from != address(0) && to != address(0) &&
-            !isWhitelisted[from] && !isWhitelisted[to];
-
-        uint256 transferAmount = value;
-        uint256 feeAmount = 0;
-
-        if (takeFee && (from != address(0) && to != address(0))) {
-            uint256 currentFee = 0;
-
-            // Determine if it's a buy or sell from any contract/pool
-            if (_isLiquidityPool(from)) {
-                // Buy transaction (Pool -> user)
-                currentFee = buyFee;
-            } else if (_isLiquidityPool(to)) {
-                // Sell transaction (user -> Pool)
-                currentFee = sellFee;
-            }
-
-            if (currentFee > 0) {
-                feeAmount = (value * currentFee) / 10000;
-                transferAmount = value - feeAmount;
-            }
-        }
+        (uint256 netAmount, uint256 feeAmount) = _splitTransferAmount(from, to, value);
 
         if (feeAmount > 0) {
             super._update(from, feeReceiver, feeAmount);
         }
 
-        super._update(from, to, transferAmount);
+        super._update(from, to, netAmount);
     }
 
     // Owner functions
     function setFees(uint256 _buyFee, uint256 _sellFee) external onlyOwner {
-        require(_buyFee >= 100 && _buyFee <= 1000, "Buy fee must be between 1% and 10%");
-        require(_sellFee >= 100 && _sellFee <= 1000, "Sell fee must be between 1% and 10%");
+        if (_buyFee < MIN_FEE_BPS || _buyFee > MAX_FEE_BPS) {
+            revert BuyFeeOutOfBounds(_buyFee);
+        }
+        if (_sellFee < MIN_FEE_BPS || _sellFee > MAX_FEE_BPS) {
+            revert SellFeeOutOfBounds(_sellFee);
+        }
 
         buyFee = _buyFee;
         sellFee = _sellFee;
@@ -119,7 +104,9 @@ contract AIBToken is ERC20, Ownable {
     }
 
     function setMaxSellPercent(uint256 _maxSellPercent) external onlyOwner {
-        require(_maxSellPercent >= 50 && _maxSellPercent <= 1000, "Max sell must be between 0.5% and 10%");
+        if (_maxSellPercent < MIN_MAX_SELL_PERCENT || _maxSellPercent > MAX_MAX_SELL_PERCENT) {
+            revert MaxSellPercentOutOfBounds(_maxSellPercent);
+        }
         maxSellPercent = _maxSellPercent;
         emit MaxSellPercentUpdated(_maxSellPercent);
     }
@@ -141,13 +128,17 @@ contract AIBToken is ERC20, Ownable {
     }
 
     function setBlacklist(address account, bool blacklisted) external onlyOwner {
-        require(account != address(0), "Invalid address");
+        if (account == address(0)) {
+            revert InvalidAddress();
+        }
         isBlacklisted[account] = blacklisted;
         emit BlacklistUpdated(account, blacklisted);
     }
 
     function updateFeeReceiver(address _feeReceiver) external onlyOwner {
-        require(_feeReceiver != address(0), "Fee receiver cannot be zero address");
+        if (_feeReceiver == address(0)) {
+            revert InvalidAddress();
+        }
         feeReceiver = _feeReceiver;
         isWhitelisted[_feeReceiver] = true;
     }
@@ -171,24 +162,84 @@ contract AIBToken is ERC20, Ownable {
     }
 
     function getMaxSellAmount() external view returns (uint256) {
-        return (totalSupply() * maxSellPercent) / 10000;
+        return (totalSupply() * maxSellPercent) / BASIS_POINTS;
     }
 
     function calculateFee(uint256 amount, bool isBuy) external view returns (uint256) {
         uint256 fee = isBuy ? buyFee : sellFee;
-        return (amount * fee) / 10000;
+        return (amount * fee) / BASIS_POINTS;
     }
 
     function updateBridgeMinter(address bridge) external onlyOwner {
-        require(bridge != address(0), "Invalid bridge");
+        if (bridge == address(0)) {
+            revert InvalidAddress();
+        }
         bridgeMinter = bridge;
         emit BridgeMinterUpdated(bridge);
     }
 
     function bridgeMint(address to, uint256 amount) external {
-        require(msg.sender == bridgeMinter, "Not bridge");
-        require(block.chainid == BRIDGE_CHAIN_ID, "Bridge mint disabled");
+        if (msg.sender != bridgeMinter) {
+            revert UnauthorizedBridgeCaller();
+        }
+        if (block.chainid != BRIDGE_CHAIN_ID) {
+            revert BridgeMintDisabled();
+        }
         _mint(to, amount);
         emit BridgeMint(to, amount);
+    }
+
+    function _enforceBlacklist(address from, address to) private view {
+        if (from != address(0) && isBlacklisted[from]) {
+            revert SenderBlacklisted();
+        }
+        if (to != address(0) && isBlacklisted[to]) {
+            revert RecipientBlacklisted();
+        }
+    }
+
+    function _enforceTradingWindow(address from, address to) private view {
+        if (tradingEnabled || from == address(0) || to == address(0)) {
+            return;
+        }
+
+        if (_isLiquidityPool(to) || _isLiquidityPool(from)) {
+            revert TradingNotEnabled();
+        }
+    }
+
+    function _enforceSellLimit(address from, address to, uint256 value) private view {
+        if (from == address(0) || !_isLiquidityPool(to) || isWhitelisted[from]) {
+            return;
+        }
+
+        uint256 maxSellAmount = (totalSupply() * maxSellPercent) / BASIS_POINTS;
+        if (value > maxSellAmount) {
+            revert SellAmountExceedsLimit();
+        }
+    }
+
+    function _splitTransferAmount(address from, address to, uint256 value)
+        private
+        view
+        returns (uint256 netAmount, uint256 feeAmount)
+    {
+        if (from == address(0) || to == address(0) || isWhitelisted[from] || isWhitelisted[to]) {
+            return (value, 0);
+        }
+
+        uint256 currentFee;
+        if (_isLiquidityPool(from)) {
+            currentFee = buyFee;
+        } else if (_isLiquidityPool(to)) {
+            currentFee = sellFee;
+        }
+
+        if (currentFee == 0) {
+            return (value, 0);
+        }
+
+        feeAmount = (value * currentFee) / BASIS_POINTS;
+        netAmount = value - feeAmount;
     }
 }
